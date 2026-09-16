@@ -1,0 +1,1 @@
+# estimator class - boiler plate for all estimators
