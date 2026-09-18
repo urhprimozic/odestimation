@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "matplotlib", "ipykernel", "ipywidgets"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

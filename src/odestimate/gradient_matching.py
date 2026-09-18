@@ -12,7 +12,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float64
 
 
-def gradient_matching(t_obs, x_obs, f, theta_0):
+def gradient_matching(t_obs, x_obs, f, theta_0, **kwargs):
     """
     Gradient matching for parameter estimation in ODEs using Gaussian Processes.
     Finds the theta that best explains the ODE system
@@ -33,6 +33,8 @@ def gradient_matching(t_obs, x_obs, f, theta_0):
         differentiated w.r.t. theta).
     theta_0 : array-like
         Initial guess for theta.
+    **kwargs : dict
+        Additional keyword arguments to pass to `scipy.optimize.least_squares`.
 
     Returns
     -------
@@ -58,4 +60,4 @@ def gradient_matching(t_obs, x_obs, f, theta_0):
         theta = torch.as_tensor(theta_np, dtype=DTYPE, device=DEVICE)
         return jacfwd(residual)(theta).detach().cpu().numpy()
 
-    return least_squares(fun, x0=theta_0, jac=jac)
+    return least_squares(fun, x0=theta_0, jac=jac, **kwargs)

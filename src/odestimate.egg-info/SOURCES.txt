@@ -1,8 +1,9 @@
 pyproject.toml
 src/odestimate/__init__.py
 src/odestimate/estimate.py
-src/odestimate/gpgm.py
+src/odestimate/estimator.py
 src/odestimate/gpim.py
+src/odestimate/gradient_matching.py
 src/odestimate/ms.py
 src/odestimate.egg-info/PKG-INFO
 src/odestimate.egg-info/SOURCES.txt
@@ -14,3 +15,5 @@ src/odestimate/gp/kernels.py
 src/odestimate/gp/regressor.py
 src/odestimate/latent/__init__.py
 src/odestimate/latent/lgpim.py
+tests/test_gp.py
+tests/test_gradient_matching.py

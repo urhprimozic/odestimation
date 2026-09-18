@@ -2,3 +2,6 @@ numpy
 torch
 scipy
 scikit-learn
+
+[test]
+pytest
