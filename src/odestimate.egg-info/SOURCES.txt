@@ -15,5 +15,6 @@ src/odestimate/gp/kernels.py
 src/odestimate/gp/regressor.py
 src/odestimate/latent/__init__.py
 src/odestimate/latent/lgpim.py
+tests/test_bled.py
 tests/test_gp.py
 tests/test_gradient_matching.py

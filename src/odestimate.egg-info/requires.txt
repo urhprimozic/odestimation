@@ -5,3 +5,6 @@ scikit-learn
 
 [test]
 pytest
+matplotlib
+ipykernel
+ipywidgets

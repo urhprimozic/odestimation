@@ -7,3 +7,6 @@ Requires-Dist: scipy
 Requires-Dist: scikit-learn
 Provides-Extra: test
 Requires-Dist: pytest; extra == "test"
+Requires-Dist: matplotlib; extra == "test"
+Requires-Dist: ipykernel; extra == "test"
+Requires-Dist: ipywidgets; extra == "test"

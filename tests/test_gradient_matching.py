@@ -55,3 +55,13 @@ def test_gradient_matching_pt(pt_data):
 
     assert result.success
     assert result.cost < _gm_cost(t, x_noisy, pt_f, theta_0)
+
+def test_trust_region(pt_data):
+    t, _, x_noisy = pt_data
+    theta_0 = PT_THETA * 1.15
+
+    result, interval = gradient_matching.uniform_trust_region(t, x_noisy, pt_f, theta_0, n_samples=10)
+
+    assert result.success
+    assert result.cost < _gm_cost(t, x_noisy, pt_f, theta_0)
+    assert interval[0] <= result.cost <= interval[1]

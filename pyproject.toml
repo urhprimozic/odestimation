@@ -6,6 +6,7 @@ dependencies = [
     "torch",
     "scipy",
     "scikit-learn",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
