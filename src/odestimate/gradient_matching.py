@@ -1,19 +1,80 @@
 # gaussian processes + gradient matching
 # interpolate the data using a GP -> interpolant x(t)
 # compare x'(t) with f(x(t), t, theta) to estimate theta
+from typing import Literal
+
 import numpy as np
 import torch
 from scipy.optimize import least_squares
 from scipy.stats import t as student_t
-from torch.func import jacfwd, jacrev, vmap
+from torch.func import jacrev, vjp
 
 from odestimate.gp.regressor import GP
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float64
 
+type Engine = Literal["torch", "scipy"]
 
-def gradient_matching(t_obs, x_obs, f, theta_0, gp=None, **kwargs):
+
+def _as_tensor(a) -> torch.Tensor:
+    return torch.as_tensor(a, dtype=DTYPE, device=DEVICE)
+
+
+def gradient_matching(ts, xs, dxs, f, theta_0, engine: Engine = "torch", **kwargs):
+    """
+    Gradient matching on PRECOMPUTED state and derivative values: finds theta minimizing
+
+        sum_i || dxs_i - f(xs_i, ts_i, theta) ||^2
+
+    Parameters
+    ----------
+    ts : array-like, shape (n,)
+        Time points.
+    xs : array-like, shape (n, d)
+        x(t_i), e.g. a GP mean (see `precompute`).
+    dxs : array-like, shape (n, d)
+        x'(t_i), e.g. a GP mean derivative (see `precompute`).
+    f : callable
+        f(x, t, theta) -> dx/dt, shape (n, d). Torch tensors in, torch out for `engine="torch"`;
+        numpy in, numpy out for `engine="scipy"`.
+    theta_0 : array-like, shape (p,)
+        Initial guess for theta.
+    engine : "torch" or "scipy"
+        "torch": exact Jacobian w.r.t. theta by reverse-mode autodiff.
+        "scipy": pure numpy, no torch involved; Jacobian by scipy's own finite
+        differences (`least_squares`' default `jac="2-point"`, override via `jac=`).
+    **kwargs :
+        Forwarded to `scipy.optimize.least_squares` (e.g. `bounds`).
+
+    Returns
+    -------
+    scipy.optimize.OptimizeResult
+        `.x` holds the estimated theta.
+    """
+    if engine == "scipy":
+        ts, xs, dxs = np.asarray(ts, float), np.asarray(xs, float), np.asarray(dxs, float)
+        return least_squares(lambda theta: (dxs - f(xs, ts, theta)).reshape(-1), x0=theta_0, **kwargs)
+
+    ts, xs, dxs = _as_tensor(ts), _as_tensor(xs), _as_tensor(dxs)
+
+    def residual(theta: torch.Tensor) -> torch.Tensor:
+        return (dxs - f(xs, ts, theta)).reshape(-1)
+
+    # least_squares itself is scipy, so theta comes in and residuals go out as numpy; on CPU both
+    # conversions are zero-copy views.
+    def fun(theta_np: np.ndarray) -> np.ndarray:
+        return residual(_as_tensor(theta_np)).detach().cpu().numpy()
+
+    # reverse mode even when p < n*d: jacrev runs f's Python once and vmaps only the backward pass
+    # over the recorded graph, while jacfwd runs f under vmap - measured 3x slower on PyBM models.
+    def jac(theta_np: np.ndarray) -> np.ndarray:
+        return jacrev(residual)(_as_tensor(theta_np)).detach().cpu().numpy()
+
+    return least_squares(fun, x0=theta_0, jac=jac, **kwargs)
+
+
+def gradient_matching_gp(t_obs, x_obs, f, theta_0, gp=None, **kwargs):
     """
     Gradient matching for parameter estimation in ODEs using Gaussian Processes.
     Finds the theta that best explains the ODE system
@@ -38,12 +99,9 @@ def gradient_matching(t_obs, x_obs, f, theta_0, gp=None, **kwargs):
     theta_0 : array-like
         Initial guess for theta.
     gp : odestimate.gp.regressor.GP, optional
-        A GP already fit elsewhere - reuse it instead of fitting a new one on `x_obs`. Lets a
-        caller fit the GP ONCE on the full dataset (best possible interpolant) and then run
-        gradient matching on a DIFFERENT (e.g. smaller, randomly sampled) set of `t_obs` query
-        points - exactly what `uniform_trust_region` below needs.
+        A GP already fit elsewhere - reuse it instead of fitting a new one on `x_obs`.
     **kwargs : dict
-        Additional keyword arguments to pass to `scipy.optimize.least_squares`.
+        Forwarded to `gradient_matching` (and from there to `scipy.optimize.least_squares`).
 
     Returns
     -------
@@ -52,82 +110,139 @@ def gradient_matching(t_obs, x_obs, f, theta_0, gp=None, **kwargs):
     """
     if gp is None:
         gp = GP(t_obs, x_obs)
-
-    # The GP interpolant and its derivative don't depend on theta - compute them ONCE, as fixed
-    # torch tensors, instead of re-querying the GP on every residual/gradient evaluation below.
-    x_hat = torch.as_tensor(gp(t_obs), dtype=DTYPE, device=DEVICE)
-    x_hat_deriv = torch.as_tensor(gp.derivative(t_obs), dtype=DTYPE, device=DEVICE)
-    t = torch.as_tensor(t_obs, dtype=DTYPE, device=DEVICE)
-
-    def residual(theta: torch.Tensor) -> torch.Tensor:
-        return (x_hat_deriv - f(x_hat, t, theta)).reshape(-1)
-
-    def fun(theta_np: np.ndarray) -> np.ndarray:
-        theta = torch.as_tensor(theta_np, dtype=DTYPE, device=DEVICE)
-        return residual(theta).detach().cpu().numpy()
-
-    def jac(theta_np: np.ndarray) -> np.ndarray:
-        theta = torch.as_tensor(theta_np, dtype=DTYPE, device=DEVICE)
-        return jacfwd(residual)(theta).detach().cpu().numpy()
-
-    return least_squares(fun, x0=theta_0, jac=jac, **kwargs)
+    return gradient_matching(t_obs, gp.mean(t_obs), gp.derivative(t_obs), f, theta_0, **kwargs)
 
 
-def confidence_interval(gp, f, t_samples, theta, p_value):
+def precompute(ts, gp, engine: Engine = "torch"):
     """
-    Computes confidence intervals for the gradient matching loss 
-            L_n(\hat \theta) +- t_{n-1}(1 - p_value / 2) * SE
-    where SE = sqrt(Var[A] + Var[B]) is the standard error of the loss 
-    where 
-     - A: the variance of the L2 loss due to subsampling 
-     - B:the variance of the L2 loss due to the GP's own uncertainty in x_hat and x_hat_deriv
-    """
-    n = len(t_samples)
-    x_hat = torch.as_tensor(gp(t_samples), dtype=DTYPE, device=DEVICE)  # (n, d)
-    x_hat_deriv = torch.as_tensor(gp.derivative(t_samples), dtype=DTYPE, device=DEVICE)  # (n, d)
-    t = torch.as_tensor(t_samples, dtype=DTYPE, device=DEVICE)
+    Everything `gradient_matching` and `confidence_interval` need from the GP at `ts`. None of it
+    depends on theta or on the candidate `f`, so compute it ONCE per (GP, test points) and share it
+    across every candidate - the per-candidate loop then never touches the GP.
 
-    r = x_hat_deriv - f(x_hat, t, theta)  # (n, d), raw residuals r_i
-    rho = (r**2).sum(dim=1)  # (n,), L2 penalty rho_i = ||r_i||^2
+    Parameters
+    ----------
+    ts : array-like, shape (n,)
+    gp : odestimate.gp.regressor.GP
+    engine : "torch" or "scipy"
+        Return torch tensors or numpy arrays - whichever the per-candidate loop will use.
+
+    Returns
+    -------
+    xs, dxs, x_vars, dx_vars, covs : each shape (n, d)
+        GP posterior mean of x(t) and x'(t), and the raw (unfloored) posterior
+        Var[x(t)], Var[x'(t)], Cov[x(t), x'(t)] at every t in `ts`.
+
+    Time complexity
+    ----------------
+    `O(n * n_gp^2)` - triangular solves against the GP's Cholesky factor.
+    """
+    values = (
+        gp.mean(ts),
+        gp.derivative(ts),
+        gp.std(ts) ** 2,
+        gp.std_derivative(ts) ** 2,
+        gp.cov_state_derivative(ts),
+    )
+    convert = _as_tensor if engine == "torch" else (lambda a: np.asarray(a, dtype=float))
+    return tuple(convert(v) for v in values)
+
+
+def _fd_Fx_transpose_r(f, xs, ts, theta, fx, r):
+    """u_i = F_x(t_i)^T r_i by forward differences: one extra (batched) f evaluation per state
+    dimension, since f acts pointwise and perturbing column k of every row at once perturbs each
+    point independently."""
+    u = np.empty_like(r)
+    for k in range(xs.shape[1]):
+        h = np.sqrt(np.finfo(float).eps) * (1.0 + np.abs(xs[:, k]))
+        xp = xs.copy()
+        xp[:, k] += h
+        dF_dxk = (f(xp, ts, theta) - fx) / h[:, None]  # (n, d): row i is dF(x_i)/dx_ik
+        u[:, k] = (dF_dxk * r).sum(axis=1)
+    return u
+
+
+def confidence_interval(ts, xs, dxs, f, theta, x_vars, dx_vars, covs, p_value=0.01, engine: Engine = "torch"):
+    """
+    Confidence interval of the gradient matching L2 loss
+
+        L_n(theta) +- t_{n-1}(1 - p_value / 2) * SE,    SE = sqrt(Var_A + Var_B)
+
+    Var_A - variance due to subsampling (sample variance of rho_i / n).
+    Var_B - variance due to the GP's uncertainty in x and x' (delta method):
+            (1/n^2) sum_i 4 r_i^T Cov[delta r_i] r_i,
+            Cov[delta r_i] = S_d - F_x S_c - S_c F_x^T + F_x S F_x^T  (S's diagonal).
+    See `notes/gradient-matching-pruning.md` (PyBM repo).
+
+    Parameters
+    ----------
+    ts : array-like, shape (n,)
+        Test time points.
+    xs, dxs : array-like, shape (n, d)
+        x(t_i) and x'(t_i) (see `precompute`).
+    f : callable
+        f(x, t, theta) -> dx/dt, shape (n, d) - torch for `engine="torch"`, numpy for "scipy".
+        Must act pointwise (row i of the output depends only on row i of x).
+    theta : array-like, shape (p,)
+        Theta at which to compute the interval.
+    x_vars : array-like, shape (n, d)
+        sigma^2 = Var(x(t) | data) at `ts`.
+    dx_vars : array-like, shape (n, d)
+        sigma_d^2 = Var(x'(t) | data) at `ts`.
+    covs : array-like, shape (n, d)
+        c = Cov(x(t), x'(t) | data) at `ts`.
+    p_value : float
+        Significance level alpha of the (1 - alpha) interval.
+    engine : "torch" or "scipy"
+        How u_i = F_x(t_i)^T r_i is obtained: "torch" - one vjp; "scipy" - forward differences
+        (d extra evaluations of f).
+
+    Time complexity
+    -----------------
+    `O(n * d)` arithmetic plus one forward and one reverse pass of `f` over the batch ("torch"),
+    or d + 1 forward passes ("scipy"). F_x is never built: since f acts pointwise, its Jacobian
+    over the batch is block-diagonal, so a single vjp with cotangent r yields u_i for every i.
+
+    Returns
+    ---------
+    (lower, upper) : tuple[float, float]
+    """
+    if engine == "scipy":
+        ts, xs, dxs = np.asarray(ts, float), np.asarray(xs, float), np.asarray(dxs, float)
+        theta = np.asarray(theta, float)
+        fx = f(xs, ts, theta)
+        r = dxs - fx
+        u = _fd_Fx_transpose_r(f, xs, ts, theta, fx, r)
+    else:
+        ts, xs, dxs, theta = _as_tensor(ts), _as_tensor(xs), _as_tensor(dxs), _as_tensor(theta)
+        fx, f_vjp = vjp(lambda x: f(x, ts, theta), xs)
+        r_t = dxs - fx
+        (u_t,) = f_vjp(r_t)
+        r, u = r_t.detach().cpu().numpy(), u_t.detach().cpu().numpy()
+
+    x_vars, dx_vars, covs = (a.detach().cpu().numpy() if torch.is_tensor(a) else np.asarray(a, float) for a in (x_vars, dx_vars, covs))
+    n = len(r)
+
+    rho = (r**2).sum(axis=1)  # (n,)
     L_n = float(rho.mean())
+    var_A = float(rho.var(ddof=1)) / n if n > 1 else 0.0
 
-    rho_np = rho.detach().cpu().numpy()
-    s2 = float(np.var(rho_np, ddof=1)) if n > 1 else 0.0  # Vir A: unbiased sample variance
-    var_A = s2 / n
-
-    # F_x(t_i, theta): (n, d, d), the RHS's own Jacobian w.r.t. its state argument, at each point
-    # independently (a per-point, not cross-point, Jacobian - same vmap(jacrev(...)) pattern used
-    # throughout PyBM for exactly this quantity).
-    def f_single(x_i, t_i):
-        return f(x_i.unsqueeze(0), t_i.unsqueeze(0), theta).squeeze(0)
-
-    F_x = vmap(jacrev(f_single, argnums=0))(x_hat, t)  # (n, d, d)
-
-    sigma2 = torch.as_tensor(gp.std(t_samples) ** 2, dtype=DTYPE, device=DEVICE)  # (n, d)
-    sigma_d2 = torch.as_tensor(gp.std_derivative(t_samples) ** 2, dtype=DTYPE, device=DEVICE)  # (n, d)
-    cross = torch.as_tensor(gp.cov_state_derivative(t_samples), dtype=DTYPE, device=DEVICE)  # (n, d)
-
-    # Cov[delta r_i] = Sigma_d - F_x.Sigma_c - Sigma_c.F_x^T + F_x.Sigma.F_x^T (Sigma's diagonal -
-    # state variables are modeled by independent GP1dims, see GP's own docstring).
-    Sigma = torch.diag_embed(sigma2)  # (n, d, d)
-    Sigma_d = torch.diag_embed(sigma_d2)  # (n, d, d)
-    Sigma_c = torch.diag_embed(cross)  # (n, d, d), symmetric (diagonal)
-
-    Fx_Sc = torch.bmm(F_x, Sigma_c)
-    cov_dr = Sigma_d - Fx_Sc - Fx_Sc.transpose(1, 2) + torch.bmm(torch.bmm(F_x, Sigma), F_x.transpose(1, 2))
-
-    # Var[delta rho_i] = 4 r_i^T Cov[delta r_i] r_i (delta rho = 2r . delta r for rho=||r||^2),
-    # clamped at 0 - cov_dr is PSD in exact arithmetic (it's A.M.A^T for the genuine, PSD joint GP
-    # covariance M), floating point can dip a hair negative.
-    var_drho = torch.clamp(4.0 * torch.einsum("ni,nij,nj->n", r, cov_dr, r), min=0.0)  # (n,)
-    var_B = float(var_drho.sum()) / n**2
+    # r^T Cov[delta r] r, expanded for diagonal S, S_d, S_c; clamped at 0 per point (PSD in exact
+    # arithmetic, floating point can dip a hair negative).
+    quad = (dx_vars * r**2 - 2 * covs * r * u + x_vars * u**2).sum(axis=1)
+    var_B = float(np.clip(4.0 * quad, 0.0, None).sum()) / n**2
 
     se = float(np.sqrt(var_A + var_B))
     t_star = float(student_t.ppf(1 - p_value / 2, df=max(n - 1, 1)))
     return L_n - t_star * se, L_n + t_star * se
 
 
-def uniform_trust_region(t_obs, x_obs, f, theta_0, n_samples, p_value=0.1,gp=None, **kwargs):
+def confidence_interval_gp(gp, f, t_samples, theta, p_value):
+    """`confidence_interval` straight from a GP - convenience wrapper around `precompute`."""
+    xs, dxs, x_vars, dx_vars, covs = precompute(t_samples, gp)
+    return confidence_interval(t_samples, xs, dxs, f, theta, x_vars, dx_vars, covs, p_value)
+
+
+def uniform_trust_region(t_obs, x_obs, f, theta_0, n_samples, p_value=0.1, gp=None, **kwargs):
     """
     Fast gradient matching for screening/pruning candidate `f`'s: fits the GP on the FULL data
     (best possible interpolant), then runs gradient matching on only `n_samples` time points
@@ -138,7 +253,7 @@ def uniform_trust_region(t_obs, x_obs, f, theta_0, n_samples, p_value=0.1,gp=Non
 
     Parameters
     ----------
-    t_obs, x_obs : as in `gradient_matching` - the FULL observed data. The GP is fit on all of it.
+    t_obs, x_obs : as in `gradient_matching_gp` - the FULL observed data. The GP is fit on all of it.
     f : as in `gradient_matching`.
     theta_0 : as in `gradient_matching`.
     n_samples : int
@@ -148,9 +263,9 @@ def uniform_trust_region(t_obs, x_obs, f, theta_0, n_samples, p_value=0.1,gp=Non
         Significance level alpha for the resulting `(1 - alpha)` confidence interval. Default
         `0.1` (90% CI).
     gp : odestimate.gp.regressor.GP, optional
-        A GP already fit elsewhere - reuse it instead of fitting a new one on `x_obs.
+        A GP already fit elsewhere - reuse it instead of fitting a new one on `x_obs`.
     **kwargs : dict
-        Forwarded to `scipy.optimize.least_squares`.
+        Forwarded to `gradient_matching` (and from there to `scipy.optimize.least_squares`).
 
     Returns
     -------
@@ -160,17 +275,12 @@ def uniform_trust_region(t_obs, x_obs, f, theta_0, n_samples, p_value=0.1,gp=Non
         `(lower, upper)` confidence bound on the L2 loss achievable with the full data and the
         true (not interpolated) trajectory - see `confidence_interval`.
     """
-    # sample points
     t_obs = np.asarray(t_obs, dtype=float)
     t_samples = np.random.default_rng().uniform(t_obs.min(), t_obs.max(), size=n_samples)
-    # fit gp
     if gp is None:
         gp = GP(t_obs, x_obs)
-    
-    # run gradient matching on sampled points 
-    result = gradient_matching(t_samples, None, f, theta_0, gp=gp, **kwargs)
 
-    theta = torch.as_tensor(result.x, dtype=DTYPE, device=DEVICE)
-    # return confidence interval 
-    interval = confidence_interval(gp, f, t_samples, theta, p_value)
+    xs, dxs, x_vars, dx_vars, covs = precompute(t_samples, gp)
+    result = gradient_matching(t_samples, xs, dxs, f, theta_0, **kwargs)
+    interval = confidence_interval(t_samples, xs, dxs, f, result.x, x_vars, dx_vars, covs, p_value)
     return result, interval

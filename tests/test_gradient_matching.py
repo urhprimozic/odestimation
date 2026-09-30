@@ -3,7 +3,7 @@ import torch
 
 from conftest import LV_THETA, PT_THETA, lv_f, pt_f
 from odestimate.gp.regressor import GP
-from odestimate.gradient_matching import DEVICE, DTYPE, gradient_matching
+from odestimate.gradient_matching import DEVICE, DTYPE, gradient_matching_gp
 
 
 def _mean_abs_error(a, b):
@@ -29,7 +29,7 @@ def test_gradient_matching_lv(lv_data):
     # see PyBM's own notes on gradient matching needing a reasonable warm start).
     theta_0 = LV_THETA * 1.15
 
-    result = gradient_matching(t, x_noisy, lv_f, theta_0)
+    result = gradient_matching_gp(t, x_noisy, lv_f, theta_0)
 
     assert result.success
     error_before = _mean_abs_error(theta_0, LV_THETA)
@@ -51,17 +51,7 @@ def test_gradient_matching_pt(pt_data):
     t, _, x_noisy = pt_data
     theta_0 = PT_THETA * 1.15
 
-    result = gradient_matching(t, x_noisy, pt_f, theta_0)
+    result = gradient_matching_gp(t, x_noisy, pt_f, theta_0)
 
     assert result.success
     assert result.cost < _gm_cost(t, x_noisy, pt_f, theta_0)
-
-def test_trust_region(pt_data):
-    t, _, x_noisy = pt_data
-    theta_0 = PT_THETA * 1.15
-
-    result, interval = gradient_matching.uniform_trust_region(t, x_noisy, pt_f, theta_0, n_samples=10)
-
-    assert result.success
-    assert result.cost < _gm_cost(t, x_noisy, pt_f, theta_0)
-    assert interval[0] <= result.cost <= interval[1]

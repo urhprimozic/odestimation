@@ -6,7 +6,7 @@ from scipy.integrate import solve_ivp
 from scipy.interpolate import interp1d
 
 from bled_model import PROBMOT_THETA, load_bled, make_f, make_scipy_rhs
-from odestimate.gradient_matching import gradient_matching
+from odestimate.gradient_matching import gradient_matching_gp
 
 BLED_PATH = Path(__file__).parent / "data" / "96.data"
 
@@ -20,7 +20,7 @@ def test_gradient_matching_bled():
     t, phyto, temp, light, daph = load_bled(BLED_PATH)
     f = make_f(torch.as_tensor(temp), torch.as_tensor(light), torch.as_tensor(daph))
 
-    result = gradient_matching(t, phyto[None, :], f, theta_0=PROBMOT_THETA)
+    result = gradient_matching_gp(t, phyto[None, :], f, theta_0=PROBMOT_THETA)
 
     assert result.success
     assert np.all(np.isfinite(result.x))
