@@ -16,7 +16,7 @@ import numpy as np
 >>> t_obs = np.linspace(0, 1, 10)
 >>> y_obs = np.sin(t_obs) * t_obs
 >>> y_obs.reshape((1,10)) # of shape (n_vars, n_time_points)
->>> gp = GP(t_obs, y_obs, kernel="rbf")
+>>> gp = GP(t_obs, y_obs, kernel="rbf", n_restarts_optimizer=10) # use more than just one restart!
 >>> # compute values at time=0.5
 >>> t=0.5
 >>> mean = gp(t)
