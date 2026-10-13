@@ -21,11 +21,23 @@ def _as_tensor(a) -> torch.Tensor:
     return torch.as_tensor(a, dtype=DTYPE, device=DEVICE)
 
 
-def gradient_matching(ts, xs, dxs, f, theta_0, engine: Engine = "torch", **kwargs):
+def powered(r, power: float = 2.0):
+    """
+    Residuals for a loss ½ Σ |r_i|^power in a least-squares solver: ρ_i = sign(r_i) |r_i|^(power/2),
+    so that ½ Σ ρ_i² = ½ Σ |r_i|^power. power = 2 is least squares; a larger power punishes large
+    residuals more (power -> inf: only the largest counts). Works on numpy arrays and torch tensors.
+    """
+    if power == 2:
+        return r
+    lib = torch if torch.is_tensor(r) else np
+    return lib.sign(r) * lib.abs(r) ** (power / 2)
+
+
+def gradient_matching(ts, xs, dxs, f, theta_0, engine: Engine = "torch", power: float = 2.0, **kwargs):
     """
     Gradient matching on PRECOMPUTED state and derivative values: finds theta minimizing
 
-        sum_i || dxs_i - f(xs_i, ts_i, theta) ||^2
+        sum_i || dxs_i - f(xs_i, ts_i, theta) ||^2       (power = 2; in general sum of |residual|^power)
 
     Parameters
     ----------
@@ -44,6 +56,9 @@ def gradient_matching(ts, xs, dxs, f, theta_0, engine: Engine = "torch", **kwarg
         "torch": exact Jacobian w.r.t. theta by reverse-mode autodiff.
         "scipy": pure numpy, no torch involved; Jacobian by scipy's own finite
         differences (`least_squares`' default `jac="2-point"`, override via `jac=`).
+    power : float
+        Exponent of the loss on the residuals, see `powered`: 2 is least squares, a larger one
+        punishes large mismatches more.
     **kwargs :
         Forwarded to `scipy.optimize.least_squares` (e.g. `bounds`).
 
@@ -54,12 +69,12 @@ def gradient_matching(ts, xs, dxs, f, theta_0, engine: Engine = "torch", **kwarg
     """
     if engine == "scipy":
         ts, xs, dxs = np.asarray(ts, float), np.asarray(xs, float), np.asarray(dxs, float)
-        return least_squares(lambda theta: (dxs - f(xs, ts, theta)).reshape(-1), x0=theta_0, **kwargs)
+        return least_squares(lambda theta: powered((dxs - f(xs, ts, theta)).reshape(-1), power), x0=theta_0, **kwargs)
 
     ts, xs, dxs = _as_tensor(ts), _as_tensor(xs), _as_tensor(dxs)
 
     def residual(theta: torch.Tensor) -> torch.Tensor:
-        return (dxs - f(xs, ts, theta)).reshape(-1)
+        return powered((dxs - f(xs, ts, theta)).reshape(-1), power)
 
     # least_squares itself is scipy, so theta comes in and residuals go out as numpy; on CPU both
     # conversions are zero-copy views.

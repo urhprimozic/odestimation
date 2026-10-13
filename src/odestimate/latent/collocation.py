@@ -5,7 +5,8 @@ Collocation: θ-parameter estimation for x' = f(x, t, θ) as the constrained pro
 
 U are the states at the seeds; between seeds the trajectory is linear in t.
     loss   compares the data at ts with the trajectory there (or with an observation of it):
-           0.5 Σ ((observation - data) / σ)², i.e. -log p(data | U, θ) for Gaussian noise.
+           0.5 Σ ((observation - data) / σ)², i.e. -log p(data | U, θ) for Gaussian noise
+           (0.5 Σ |(observation - data) / σ|^power with `power`).
     g      the slope of the trajectory minus f, at the ODE points: g = 0 makes the trajectory
            solve the ODE.
 No integrator, and no GP: the states are unknowns, the ODE a constraint on them.
@@ -24,6 +25,7 @@ import numpy as np
 from scipy import sparse
 from scipy.optimize import Bounds, NonlinearConstraint, OptimizeResult, minimize
 
+from odestimate.gradient_matching import powered
 from odestimate.latent.magi import _pointwise_derivatives
 
 
@@ -72,8 +74,8 @@ class _Problem:
     at m points are V @ U, flattened by kron(V, I_D) @ U.ravel().
     """
 
-    def __init__(self, f, ts, seeds, ode_points, ys, sigma, observe, D, p):
-        self.f, self.observe, self.ts, self.ode_points = f, observe, ts, ode_points
+    def __init__(self, f, ts, seeds, ode_points, ys, sigma, observe, D, p, power=2.0):
+        self.f, self.observe, self.ts, self.ode_points, self.power = f, observe, ts, ode_points, power
         self.n, self.D, self.p = len(seeds), D, p
         self.V_data, _ = _linear_interpolation(ts, seeds)
         self.V_ode, self.S_ode = _linear_interpolation(ode_points, seeds)
@@ -97,7 +99,7 @@ class _Problem:
         U, theta = self.unpack(z)
         r = ((self._observation(self.V_data @ U, theta) - self.ys) / self.sigma)[self.mask]
         g = (self.S_ode @ U - self._f(self.V_ode @ U, theta)).ravel()
-        return r, g
+        return powered(r, self.power), g
 
     def linearize(self, z):
         """(r, J_r, g, J_g), the Jacobians sparse; d/dx and d/dθ of f and of the observation by
@@ -117,6 +119,9 @@ class _Problem:
             sparse.csr_matrix((Yt * per_channel).reshape(-1, self.p)),
         ], format="csr")[self.mask.ravel()]
         r = ((Y - self.ys) / self.sigma)[self.mask]
+        if self.power != 2:  # ρ = sign(r) |r|^(power/2), dρ/dr = power/2 |r|^(power/2 - 1)
+            J_r = sparse.diags(self.power / 2 * np.abs(r) ** (self.power / 2 - 1)) @ J_r
+            r = powered(r, self.power)
 
         X = self.V_ode @ U
         F = self._f(X, theta)
@@ -180,8 +185,66 @@ def _initial_states(f, ts, xs, seeds, theta_0, unobserved_inits):
     return U
 
 
+def _clip(theta, bounds):
+    if bounds is None:
+        return theta
+    return np.clip(theta, *(np.broadcast_to(np.asarray(b, float), theta.shape) for b in bounds))
+
+
+def _minimize(evaluate, linearize, U_0, theta_0, bounds, kwargs):
+    """
+    Minimizes ½ |r(z)|² subject to g(z) = 0 over z = (U.ravel(), θ), from U_0 (n, D) and θ_0, with
+    trust-constr and a Gauss-Newton model: `evaluate(z) -> (r, g)`, `linearize(z) -> (r, J_r, g, J_g)`.
+    θ within `bounds`, the states free; no constraint if g is empty. `kwargs` for `minimize`.
+    Returns minimize's result with .x in z.
+    """
+    lo, hi = (-np.inf, np.inf) if bounds is None else bounds
+    lo, hi = (np.broadcast_to(np.asarray(b, float), theta_0.shape) for b in (lo, hi))
+    free = np.full(U_0.size, np.inf)
+    z_lo, z_hi = np.r_[-free, lo], np.r_[free, hi]
+
+    # trust-constr's trust region is a ball in its variables and it has no x_scale: states in the
+    # hundreds and a rate of 0.1 would share one radius. So it works in w = z / scale, the scale of
+    # every state its component's mean |start|, of every parameter its |start|.
+    typical = lambda a: np.where(a > 0, a, 1.0)
+    scale = np.r_[np.tile(typical(np.abs(U_0).mean(axis=0)), len(U_0)), typical(np.abs(theta_0))]
+    S = sparse.diags(scale)
+
+    def loss(w):
+        r, _ = evaluate(scale * w)
+        return 0.5 * float(r @ r)
+
+    def gradient(w):
+        r, J_r, _, _ = linearize(scale * w)
+        return scale * (J_r.T @ r)
+
+    def gauss_newton_hessian(w):
+        _, J_r, _, _ = linearize(scale * w)
+        J = J_r @ S
+        return (J.T @ J).tocsr()
+
+    # Gauss-Newton also drops the curvature of g (its linearization is kept), as in multiple shooting.
+    z_0 = np.r_[U_0.ravel(), theta_0]
+    constraints = []
+    if len(evaluate(z_0)[1]):
+        constraints.append(NonlinearConstraint(lambda w: evaluate(scale * w)[1], 0.0, 0.0,
+                                               jac=lambda w: linearize(scale * w)[3] @ S,
+                                               hess=lambda w, v: sparse.csr_matrix((len(scale), len(scale)))))
+    # trust-constr's default tolerances (1e-8) are below the noise of the forward-difference
+    # derivatives (~1e-6): it would stop only at maxiter.
+    kwargs = dict(kwargs)
+    options = {"gtol": 1e-4, "barrier_tol": 1e-4, **kwargs.pop("options", {})}
+    defaults = {"method": "trust-constr", "jac": gradient, "hess": gauss_newton_hessian, "constraints": constraints,
+                "options": options}
+    if bounds is not None:
+        defaults["bounds"] = Bounds(z_lo / scale, z_hi / scale)
+    result = minimize(loss, z_0 / scale, **{**defaults, **kwargs})
+    result.x = scale * result.x
+    return result
+
+
 def collocation(f, ts, xs, theta_0, unobserved=None, unobserved_inits=None, n_seeds=None, seeds=None,
-                n_ode_points=None, ode_points=None, observe=None, ys=None, sigma=None, bounds=None, **kwargs):
+                n_ode_points=None, ode_points=None, observe=None, ys=None, sigma=None, bounds=None, power=2.0, **kwargs):
     """
     θ-parameter estimation for x' = f(x, t, θ): minimize the loss on the data subject to g = 0
     (see the module docstring), with trust-constr and a Gauss-Newton model of the loss.
@@ -222,6 +285,9 @@ def collocation(f, ts, xs, theta_0, unobserved=None, unobserved_inits=None, n_se
         each channel's data.
     bounds : (lo, hi), optional
         Bounds on θ.
+    power : float
+        Exponent of the data term, ½ Σ |r_i|^power (r_i the residuals divided by σ): 2 is least
+        squares, a larger one punishes large deviations more.
     **kwargs :
         Forwarded to `scipy.optimize.minimize`, over the defaults method="trust-constr", the
         Gauss-Newton gradient and Hessian and the constraint g = 0. `options` are merged over
@@ -248,49 +314,12 @@ def collocation(f, ts, xs, theta_0, unobserved=None, unobserved_inits=None, n_se
 
     seeds, ode_points = _points(ts, n_seeds, seeds, n_ode_points, ode_points)
     D, p = xs.shape[1], len(theta_0)
-    problem = _Problem(f, ts, seeds, ode_points, ys, sigma, observe, D, p)
+    problem = _Problem(f, ts, seeds, ode_points, ys, sigma, observe, D, p, power)
     evaluate, linearize = _cached(problem.evaluate), _cached(problem.linearize)
 
-    lo, hi = (-np.inf, np.inf) if bounds is None else bounds
-    lo, hi = (np.broadcast_to(np.asarray(b, float), theta_0.shape) for b in (lo, hi))
-    theta_0 = np.clip(theta_0, lo, hi)
+    theta_0 = _clip(theta_0, bounds)
     U_0 = _initial_states(f, ts, xs, seeds, theta_0, unobserved_inits)
-    free = np.full(U_0.size, np.inf)
-    z_lo, z_hi = np.r_[-free, lo], np.r_[free, hi]
-
-    # trust-constr's trust region is a ball in its variables and it has no x_scale: states in the
-    # hundreds and a rate of 0.1 would share one radius. So it works in w = z / scale, the scale of
-    # every state its component's mean |start|, of every parameter its |start|.
-    typical = lambda a: np.where(a > 0, a, 1.0)
-    scale = np.r_[np.tile(typical(np.abs(U_0).mean(axis=0)), len(seeds)), typical(np.abs(theta_0))]
-    S = sparse.diags(scale)
-
-    def loss(w):
-        r, _ = evaluate(scale * w)
-        return 0.5 * float(r @ r)
-
-    def gradient(w):
-        r, J_r, _, _ = linearize(scale * w)
-        return scale * (J_r.T @ r)
-
-    def gauss_newton_hessian(w):
-        _, J_r, _, _ = linearize(scale * w)
-        J = J_r @ S
-        return (J.T @ J).tocsr()
-
-    # Gauss-Newton also drops the curvature of g (its linearization is kept), as in multiple shooting.
-    constraint = NonlinearConstraint(lambda w: evaluate(scale * w)[1], 0.0, 0.0,
-                                     jac=lambda w: linearize(scale * w)[3] @ S,
-                                     hess=lambda w, v: sparse.csr_matrix((len(scale), len(scale))))
-    # trust-constr's default tolerances (1e-8) are below the noise of the forward-difference
-    # derivatives (~1e-6): it would stop only at maxiter.
-    options = {"gtol": 1e-4, "barrier_tol": 1e-4, **kwargs.pop("options", {})}
-    defaults = {"method": "trust-constr", "jac": gradient, "hess": gauss_newton_hessian, "constraints": [constraint],
-                "options": options}
-    if bounds is not None:
-        defaults["bounds"] = Bounds(z_lo / scale, z_hi / scale)
-    result = minimize(loss, np.r_[U_0.ravel(), theta_0] / scale, **{**defaults, **kwargs})
-    result.x = scale * result.x
+    result = _minimize(evaluate, linearize, U_0, theta_0, bounds, kwargs)
 
     U, theta = problem.unpack(result.x)
     result.theta, result.x, result.x_ts = theta, U, problem.V_data @ U
