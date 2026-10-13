@@ -34,6 +34,8 @@ from scipy.optimize import OptimizeResult, least_squares
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, Matern, WhiteKernel
 
+from odestimate.matching.operators import pointwise_derivatives as _pointwise_derivatives
+
 KernelKind = Literal["matern52", "matern32", "rbf"]
 
 
@@ -122,27 +124,6 @@ def _component(kind: KernelKind, signal_var: float, length_scale: float, mu: flo
         Phi=None if same else solve(k_es),
         Phi_data=Phi_data,
     )
-
-
-def _pointwise_derivatives(g, X, t, theta, G):
-    """dG/dx (m, q, D) and dG/dθ (m, q, p) of a pointwise function G = g(X, t, θ), by forward
-    differences: perturbing one column of every row at once perturbs each point independently,
-    so it takes one call of g per state dimension and per parameter."""
-    eps = np.sqrt(np.finfo(float).eps)
-    m, D = X.shape
-    Gx = np.empty((m, G.shape[1], D))
-    for e in range(D):
-        h = eps * np.maximum(1.0, np.abs(X[:, e]))
-        Xp = X.copy()
-        Xp[:, e] += h
-        Gx[:, :, e] = (np.asarray(g(Xp, t, theta), float).reshape(G.shape) - G) / h[:, None]
-    Gt = np.empty((m, G.shape[1], len(theta)))
-    for k in range(len(theta)):
-        h = eps * max(1.0, abs(theta[k]))
-        tp = theta.copy()
-        tp[k] += h
-        Gt[:, :, k] = (np.asarray(g(X, t, tp), float).reshape(G.shape) - G) / h
-    return Gx, Gt
 
 
 # ------------------------------------------------------------------------------------ problem ----
